@@ -1,0 +1,12 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+streamlit==1.28.0
+streamlit-autorefresh==0.0.1
+plotly==5.17.0
+opencv-python==4.8.1.78
+mediapipe==0.10.7
+numpy==1.24.3
+scipy==1.11.4
+requests==2.31.0
+python-multipart==0.0.6
+pandas==2.1.4
