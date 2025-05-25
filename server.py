@@ -1,57 +1,123 @@
-# backend.py
+# Enhanced Facial Heart Rate Detection Backend API
 import threading
 import time
 import cv2
 import numpy as np
 import mediapipe as mp
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import base64
+from datetime import datetime, timedelta
+import os
+from pathlib import Path
 
 from collections import deque
 from scipy.signal import butter, filtfilt, detrend, welch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 import io
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+# FastAPI app configuration
+app = FastAPI(
+    title="Facial Heart Rate Detection API",
+    description="A real-time heart rate detection system using facial recognition and photoplethysmography",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
-# Allow Streamlit frontend to call us
+# Enhanced CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_origins=["*"],  # Configure specific domains in production
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# — rPPG CONFIG —
-BUFFER_SIZE = 200          # ~10s at 20 FPS for better stability
-MIN_HZ, MAX_HZ = 0.7, 4.0  # 42–240 BPM
-SAMPLING_RATE = 20         # Target FPS
-CONFIDENCE_THRESHOLD = 0.6
+# Pydantic models for API responses
+class HeartRateResponse(BaseModel):
+    bpm: int
+    confidence: str
+    message: str
+    face_detected: bool
+    buffer_fill: str
+    timestamp: float
+    signal_quality: str
 
-# Global state
-signal_buffer = deque(maxlen=BUFFER_SIZE)
-time_buffer = deque(maxlen=BUFFER_SIZE)
+class SystemStatusResponse(BaseModel):
+    camera_active: bool
+    face_detected: bool
+    buffer_size: int
+    max_buffer_size: int
+    time_since_last_update: float
+    signal_quality: str
+    api_version: str
+    system_health: str
+
+class FrameResponse(BaseModel):
+    frame: str
+    face_detected: bool
+    bpm: int
+    timestamp: float
+    frame_width: int
+    frame_height: int
+
+class HealthCheckResponse(BaseModel):
+    status: str
+    timestamp: str
+    version: str
+    uptime_seconds: float
+
+# System configuration
+class Config:
+    # rPPG CONFIG
+    BUFFER_SIZE = 200          # ~10s at 20 FPS for better stability
+    MIN_HZ, MAX_HZ = 0.7, 4.0  # 42–240 BPM
+    SAMPLING_RATE = 20         # Target FPS
+    CONFIDENCE_THRESHOLD = 0.6
+    
+    # Camera settings
+    CAMERA_WIDTH = 640
+    CAMERA_HEIGHT = 480
+    CAMERA_FPS = 20
+    
+    # Health monitoring
+    MAX_NO_UPDATE_SECONDS = 10
+    MAX_POOR_SIGNAL_SECONDS = 30
+
+# Application startup time for uptime calculation
+APP_START_TIME = datetime.now()
+
+# Enhanced global state
+signal_buffer = deque(maxlen=Config.BUFFER_SIZE)
+time_buffer = deque(maxlen=Config.BUFFER_SIZE)
 latest_bpm = 0
 is_camera_active = False
 face_detected = False
 last_update_time = 0
 current_frame = None
 camera_lock = threading.Lock()
+frame_count = 0
+processing_errors = 0
 
 # init MediaPipe FaceMesh once
 mp_mesh = mp.solutions.face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
     refine_landmarks=True,
-    min_detection_confidence=CONFIDENCE_THRESHOLD,
-    min_tracking_confidence=CONFIDENCE_THRESHOLD
+    min_detection_confidence=Config.CONFIDENCE_THRESHOLD,
+    min_tracking_confidence=Config.CONFIDENCE_THRESHOLD
 )
 
 def bandpass(data, low, high, fs, order=4):
@@ -111,7 +177,7 @@ def extract_roi_signal(frame, landmarks, roi_indices):
 
 def _video_loop():
     """ Continuously capture frames, extract green-channel rPPG, compute BPM. """
-    global latest_bpm, is_camera_active, face_detected, last_update_time, current_frame
+    global latest_bpm, is_camera_active, face_detected, last_update_time, current_frame, frame_count, processing_errors
     
     cap = None
     try:
@@ -121,9 +187,9 @@ def _video_loop():
             return
             
         # Set camera properties for consistent frame rate
-        cap.set(cv2.CAP_PROP_FPS, SAMPLING_RATE)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, Config.CAMERA_FPS)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.CAMERA_HEIGHT)
         
         is_camera_active = True
         logger.info("Camera initialized successfully")
@@ -138,6 +204,7 @@ def _video_loop():
             ret, frame = cap.read()
             if not ret:
                 logger.warning("Failed to read frame")
+                processing_errors += 1
                 time.sleep(0.1)
                 continue
 
@@ -149,7 +216,7 @@ def _video_loop():
             frame_count += 1
             
             # Process at target sampling rate
-            if current_time - last_processing_time < 1.0 / SAMPLING_RATE:
+            if current_time - last_processing_time < 1.0 / Config.SAMPLING_RATE:
                 continue
                 
             last_processing_time = current_time
@@ -173,7 +240,7 @@ def _video_loop():
                     last_update_time = current_time
 
             # Compute BPM when we have sufficient data
-            if len(signal_buffer) >= BUFFER_SIZE * 0.8:  # Use 80% of buffer for more frequent updates
+            if len(signal_buffer) >= Config.BUFFER_SIZE * 0.8:  # Use 80% of buffer for more frequent updates
                 try:
                     times = np.array(time_buffer)
                     if len(times) < 2:
@@ -186,7 +253,7 @@ def _video_loop():
                         
                     fs = len(times) / duration
                     
-                    if fs < MIN_HZ * 2:  # Nyquist criterion
+                    if fs < Config.MIN_HZ * 2:  # Nyquist criterion
                         logger.warning(f"Sampling rate too low: {fs:.2f} Hz")
                         continue
                     
@@ -201,7 +268,7 @@ def _video_loop():
                     sig = detrend(sig)
                     
                     # Apply bandpass filter
-                    sig_filtered = bandpass(sig, MIN_HZ, MAX_HZ, fs)
+                    sig_filtered = bandpass(sig, Config.MIN_HZ, Config.MAX_HZ, fs)
                     
                     # Power spectral density analysis
                     nperseg = min(len(sig_filtered) // 2, 128)
@@ -211,7 +278,7 @@ def _video_loop():
                     freqs, psd = welch(sig_filtered, fs, nperseg=nperseg, noverlap=nperseg//2)
                     
                     # Find peak in valid frequency range
-                    valid_mask = (freqs >= MIN_HZ) & (freqs <= MAX_HZ)
+                    valid_mask = (freqs >= Config.MIN_HZ) & (freqs <= Config.MAX_HZ)
                     if not valid_mask.any():
                         continue
                         
@@ -234,12 +301,14 @@ def _video_loop():
                         logger.info(f"BPM updated: {latest_bpm}, Peak freq: {peak_freq:.2f} Hz")
                         
                 except Exception as e:
+                    processing_errors += 1
                     logger.error(f"BPM computation error: {e}")
             
             # Control frame processing rate
             time.sleep(0.01)
             
     except Exception as e:
+        processing_errors += 1
         logger.error(f"Video loop error: {e}")
     finally:
         is_camera_active = False
@@ -247,35 +316,97 @@ def _video_loop():
             cap.release()
         logger.info("Camera released")
 
-# start background thread
-video_thread = threading.Thread(target=_video_loop, daemon=True)
-video_thread.start()
-logger.info("Video processing thread started")
+# Application startup and lifecycle management
 
-@app.get("/")
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application on startup"""
+    logger.info("Starting Facial Heart Rate Detection API v2.0.0")
+    logger.info(f"Camera resolution: {Config.CAMERA_WIDTH}x{Config.CAMERA_HEIGHT}")
+    logger.info(f"Target FPS: {Config.CAMERA_FPS}")
+    logger.info(f"BPM range: {Config.MIN_HZ*60:.0f}-{Config.MAX_HZ*60:.0f}")
+    
+    # Start background video processing thread
+    video_thread = threading.Thread(target=_video_loop, daemon=True)
+    video_thread.start()
+    logger.info("Video processing thread started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on application shutdown"""
+    global is_camera_active
+    logger.info("Shutting down application...")
+    is_camera_active = False
+    logger.info("Application shutdown complete")
+
+# For development and testing
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,  # Disable reload in production
+        workers=1,     # Single worker for camera access
+        log_level="info"
+    )
+
+# Enhanced API endpoints with Pydantic models
+
+@app.get("/", response_model=HealthCheckResponse)
 async def root():
-    """Health check endpoint"""
-    return {"status": "Heart rate detection server is running"}
+    """Health check endpoint with system information"""
+    uptime = (datetime.now() - APP_START_TIME).total_seconds()
+    return HealthCheckResponse(
+        status="Heart rate detection server is running",
+        timestamp=datetime.now().isoformat(),
+        version="2.0.0",
+        uptime_seconds=uptime
+    )
 
-@app.get("/status")
+@app.get("/health", response_model=HealthCheckResponse)
+async def health_check():
+    """Detailed health check endpoint"""
+    uptime = (datetime.now() - APP_START_TIME).total_seconds()
+    return HealthCheckResponse(
+        status="healthy" if is_camera_active else "degraded",
+        timestamp=datetime.now().isoformat(),
+        version="2.0.0",
+        uptime_seconds=uptime
+    )
+
+@app.get("/status", response_model=SystemStatusResponse)
 async def get_status():
-    """Get system status"""
-    global last_update_time
+    """Get comprehensive system status"""
+    global last_update_time, processing_errors
     current_time = time.time()
     time_since_update = current_time - last_update_time if last_update_time > 0 else float('inf')
     
-    return {
-        "camera_active": is_camera_active,
-        "face_detected": face_detected,
-        "buffer_size": len(signal_buffer),
-        "max_buffer_size": BUFFER_SIZE,
-        "time_since_last_update": time_since_update,
-        "signal_quality": "good" if time_since_update < 2.0 else "poor"
-    }
+    # Determine signal quality
+    if time_since_update > Config.MAX_POOR_SIGNAL_SECONDS:
+        signal_quality = "poor"
+        system_health = "degraded"
+    elif time_since_update > 5.0:
+        signal_quality = "fair"
+        system_health = "fair"
+    else:
+        signal_quality = "good"
+        system_health = "healthy"
+    
+    return SystemStatusResponse(
+        camera_active=is_camera_active,
+        face_detected=face_detected,
+        buffer_size=len(signal_buffer),
+        max_buffer_size=Config.BUFFER_SIZE,
+        time_since_last_update=time_since_update,
+        signal_quality=signal_quality,
+        api_version="2.0.0",
+        system_health=system_health
+    )
 
-@app.get("/bpm")
+@app.get("/bpm", response_model=HeartRateResponse)
 async def get_bpm():
-    """Return the most recent BPM estimate."""
+    """Return the most recent BPM estimate with enhanced metadata."""
     global last_update_time
     
     if not is_camera_active:
@@ -284,24 +415,45 @@ async def get_bpm():
     current_time = time.time()
     time_since_update = current_time - last_update_time if last_update_time > 0 else float('inf')
     
-    # Check if data is recent enough
-    if time_since_update > 5.0:  # No update for 5 seconds
+    # Determine confidence and signal quality
+    if time_since_update > Config.MAX_NO_UPDATE_SECONDS:
         confidence = "low"
+        signal_quality = "poor"
         message = "No recent face detection"
-    elif time_since_update > 2.0:  # No update for 2 seconds
+    elif time_since_update > 5.0:
         confidence = "medium"
+        signal_quality = "fair"
         message = "Face detection intermittent"
     else:
         confidence = "high"
+        signal_quality = "good"
         message = "Face detected"
     
+    return HeartRateResponse(
+        bpm=latest_bpm,
+        confidence=confidence,
+        message=message,
+        face_detected=face_detected,
+        buffer_fill=f"{len(signal_buffer)}/{Config.BUFFER_SIZE}",
+        timestamp=current_time,
+        signal_quality=signal_quality
+    )
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get system metrics for monitoring"""
+    global processing_errors, frame_count
+    uptime = (datetime.now() - APP_START_TIME).total_seconds()
+    
     return {
-        "bpm": latest_bpm,
-        "confidence": confidence,
-        "message": message,
+        "uptime_seconds": uptime,
+        "frames_processed": frame_count,
+        "processing_errors": processing_errors,
+        "error_rate": processing_errors / max(frame_count, 1),
+        "buffer_utilization": len(signal_buffer) / Config.BUFFER_SIZE,
+        "camera_active": is_camera_active,
         "face_detected": face_detected,
-        "buffer_fill": f"{len(signal_buffer)}/{BUFFER_SIZE}",
-        "timestamp": current_time
+        "current_bpm": latest_bpm
     }
 
 def generate_frames():
@@ -309,8 +461,9 @@ def generate_frames():
     while is_camera_active:
         with camera_lock:
             if current_frame is not None:
-                # Draw face detection indicators on frame for visual feedback
+                # Draw enhanced overlay information on frame
                 frame_with_overlay = current_frame.copy()
+                h, w = frame_with_overlay.shape[:2]
                 
                 # Add face detection indicator
                 if face_detected:
@@ -318,18 +471,26 @@ def generate_frames():
                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     cv2.putText(frame_with_overlay, f"BPM: {latest_bpm}", (10, 70), 
                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    # Add green border for face detected
+                    cv2.rectangle(frame_with_overlay, (5, 5), (w-5, h-5), (0, 255, 0), 3)
                 else:
-                    cv2.putText(frame_with_overlay, "No Face", (10, 30), 
+                    cv2.putText(frame_with_overlay, "No Face Detected", (10, 30), 
                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    # Add red border for no face
+                    cv2.rectangle(frame_with_overlay, (5, 5), (w-5, h-5), (0, 0, 255), 3)
                 
-                # Add buffer status
-                buffer_status = f"Buffer: {len(signal_buffer)}/{BUFFER_SIZE}"
+                # Add buffer status and timestamp
+                buffer_status = f"Buffer: {len(signal_buffer)}/{Config.BUFFER_SIZE}"
                 cv2.putText(frame_with_overlay, buffer_status, (10, 110), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                cv2.putText(frame_with_overlay, timestamp, (10, h-20), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
                 # Encode frame as JPEG
                 _, buffer = cv2.imencode('.jpg', frame_with_overlay, 
-                                       [cv2.IMWRITE_JPEG_QUALITY, 80])
+                                       [cv2.IMWRITE_JPEG_QUALITY, 85])
                 frame_bytes = buffer.tobytes()
                 
                 yield (b'--frame\r\n'
@@ -346,14 +507,15 @@ async def video_feed():
     return StreamingResponse(generate_frames(), 
                            media_type="multipart/x-mixed-replace; boundary=frame")
 
-@app.get("/current_frame")
+@app.get("/current_frame", response_model=FrameResponse)
 async def get_current_frame():
-    """Get the current frame as base64 encoded image."""
+    """Get the current frame as base64 encoded image with metadata."""
     if not is_camera_active or current_frame is None:
         raise HTTPException(status_code=503, detail="Camera not active or no frame available")
     
     with camera_lock:
         frame_copy = current_frame.copy()
+        h, w = frame_copy.shape[:2]
         
         # Add overlay information
         if face_detected:
@@ -361,17 +523,30 @@ async def get_current_frame():
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.putText(frame_copy, f"BPM: {latest_bpm}", (10, 70), 
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.rectangle(frame_copy, (5, 5), (w-5, h-5), (0, 255, 0), 3)
         else:
-            cv2.putText(frame_copy, "No Face", (10, 30), 
+            cv2.putText(frame_copy, "No Face Detected", (10, 30), 
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.rectangle(frame_copy, (5, 5), (w-5, h-5), (0, 0, 255), 3)
+        
+        # Add buffer and timestamp info
+        buffer_status = f"Buffer: {len(signal_buffer)}/{Config.BUFFER_SIZE}"
+        cv2.putText(frame_copy, buffer_status, (10, 110), 
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        cv2.putText(frame_copy, timestamp, (10, h-20), 
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # Encode frame as JPEG and convert to base64
-        _, buffer = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        _, buffer = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 85])
         frame_b64 = base64.b64encode(buffer).decode('utf-8')
         
-        return {
-            "frame": frame_b64,
-            "face_detected": face_detected,
-            "bpm": latest_bpm,
-            "timestamp": time.time()
-        }
+        return FrameResponse(
+            frame=frame_b64,
+            face_detected=face_detected,
+            bpm=latest_bpm,
+            timestamp=time.time(),
+            frame_width=w,
+            frame_height=h
+        )
